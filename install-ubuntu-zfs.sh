@@ -66,6 +66,68 @@ BASH_XTRACEFD=9
 PS4='+[%(%H:%M:%S)T][L${LINENO}] '
 set -x
 
+# ── Argument parsing ──────────────────────────────────────────────────────────
+# All flags are optional — any omitted value falls back to the interactive prompt.
+# Passwords passed on the command line appear in /proc/<pid>/cmdline while the
+# script runs; acceptable on a single-user live ISO, but be aware.
+_usage() {
+    cat <<EOF
+Usage: sudo bash $0 [OPTIONS]
+
+  --release   CODENAME   Ubuntu codename (e.g. resolute, noble)
+  --hostname  NAME       System hostname
+  --disk      DEV        Target disk (default: /dev/nvme0n1)
+  --user      NAME       Non-root username (creates user, locks root)
+  --password  PASS       Password for the non-root user
+  --no-user              No non-root user; set root password instead
+  --root-password PASS   Root password (only used with --no-user)
+  --timezone  TZ         Timezone (e.g. UTC, America/Chicago)
+  --locale    LOCALE     Locale (e.g. en_US.UTF-8)
+  --home-quota SIZE      ZFS quota for /home (e.g. 200G, 1T, none)
+  --yes                  Skip the YES confirmation prompt (dangerous!)
+  -h, --help             Show this help
+
+Examples:
+  sudo bash $0 --release resolute --hostname myserver --user jason --yes
+  sudo bash $0 --release resolute --no-user --root-password s3cr3t --yes
+EOF
+    exit 0
+}
+
+# Pre-initialize all flag-settable vars as empty so prompt logic can test them
+UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
+HOSTNAME_NEW="${HOSTNAME_NEW:-}"
+TARGET_DISK="${TARGET_DISK:-/dev/nvme0n1}"
+ADD_USER=""        # set by --user / --no-user; empty = ask interactively
+NEW_USER=""
+USER_PASSWORD=""
+ROOT_PASSWORD=""
+TIMEZONE="${TIMEZONE:-}"
+LOCALE="${LOCALE:-}"
+HOME_QUOTA="${HOME_QUOTA:-}"
+AUTO_CONFIRM=no
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release|--codename) UBUNTU_CODENAME="$2";  shift 2 ;;
+        --hostname)           HOSTNAME_NEW="$2";      shift 2 ;;
+        --disk)               TARGET_DISK="$2";       shift 2 ;;
+        --user)               NEW_USER="$2"; ADD_USER=yes; shift 2 ;;
+        --password)           USER_PASSWORD="$2";     shift 2 ;;
+        --no-user)            ADD_USER=no;             shift   ;;
+        --root-password)      ROOT_PASSWORD="$2";     shift 2 ;;
+        --timezone)           TIMEZONE="$2";          shift 2 ;;
+        --locale)             LOCALE="$2";            shift 2 ;;
+        --home-quota)         HOME_QUOTA="$2";        shift 2 ;;
+        --yes|-y)             AUTO_CONFIRM=yes;        shift   ;;
+        -h|--help)            _usage ;;
+        *) die "Unknown flag: $1  (run with --help for usage)" ;;
+    esac
+done
+
+# Validate disk early so we fail before any interactive prompts
+[[ -b "${TARGET_DISK}" ]] || die "Disk not found: ${TARGET_DISK}"
+
 # ── Prerequisite check & auto-install ────────────────────────────────────────
 banner "Checking prerequisites"
 
@@ -131,28 +193,32 @@ _prompt_pw() {
 
 echo -e "${BOLD}Ubuntu codename${RESET}"
 echo -e "  Verify 26.04's codename on a running system: lsb_release -cs"
-_prompt "Ubuntu codename" UBUNTU_CODENAME "noble"
-_prompt  "Hostname"                    HOSTNAME_NEW   "ubuntu-server"
-read -rp "$(echo -e "${YELLOW}Add a non-root user? [Y/n]: ${RESET}")" _ADD_USER_REPLY
-if [[ "${_ADD_USER_REPLY,,}" != "n" ]]; then
-    ADD_USER=yes
-    _prompt "New (non-root) username" NEW_USER
+[[ -n "${UBUNTU_CODENAME}" ]] || _prompt "Ubuntu codename" UBUNTU_CODENAME "noble"
+[[ -n "${HOSTNAME_NEW}"     ]] || _prompt "Hostname"        HOSTNAME_NEW    "ubuntu-server"
+
+if [[ -z "${ADD_USER}" ]]; then
+    read -rp "$(echo -e "${YELLOW}Add a non-root user? [Y/n]: ${RESET}")" _ADD_USER_REPLY
+    [[ "${_ADD_USER_REPLY,,}" != "n" ]] && ADD_USER=yes || ADD_USER=no
+fi
+
+if [[ "${ADD_USER}" == "yes" ]]; then
+    [[ -n "${NEW_USER}"      ]] || _prompt "New (non-root) username" NEW_USER
     # Validate before any destructive operations — reject slashes/spaces/special chars
     # that could cause path traversal in sudoers.d or malformed useradd calls.
     [[ "${NEW_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
         die "Invalid username '${NEW_USER}': use 1-31 chars, start with [a-z_], contain only [a-z0-9_-]"
-    _prompt_pw "Password for ${NEW_USER}" USER_PASSWORD
+    [[ -n "${USER_PASSWORD}" ]] || _prompt_pw "Password for ${NEW_USER}" USER_PASSWORD
     ROOT_PASSWORD=""
 else
-    ADD_USER=no
     NEW_USER=""
     USER_PASSWORD=""
-    _prompt_pw "Root password" ROOT_PASSWORD
+    [[ -n "${ROOT_PASSWORD}" ]] || _prompt_pw "Root password" ROOT_PASSWORD
 fi
+
 echo -e "${YELLOW}Timezone — e.g. UTC, America/Chicago, Europe/London${RESET}"
-_prompt  "Timezone"    TIMEZONE  "UTC"
+[[ -n "${TIMEZONE}"    ]] || _prompt "Timezone" TIMEZONE "UTC"
 echo -e "${YELLOW}Locale — e.g. en_US.UTF-8, en_GB.UTF-8${RESET}"
-_prompt  "Locale"      LOCALE    "en_US.UTF-8"
+[[ -n "${LOCALE}"      ]] || _prompt "Locale"   LOCALE   "en_US.UTF-8"
 # Auto-size swap: equal to RAM up to 8G, half RAM up to 32G, capped at 16G above that.
 # Supports hibernate when RAM ≤ 8G; sensible overhead above that.
 _ram_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
@@ -163,9 +229,7 @@ else                           SWAP_SIZE="16G"
 fi
 info "Detected ${_ram_gb}G RAM → swap zvol auto-sized to ${SWAP_SIZE}"
 echo -e "${YELLOW}/home total quota — ZFS size (e.g. 200G, 1T) or 'none'${RESET}"
-_prompt  "/home quota" HOME_QUOTA "none"
-
-[[ -b "${TARGET_DISK}" ]] || die "Disk not found: ${TARGET_DISK}"
+[[ -n "${HOME_QUOTA}" ]] || _prompt "/home quota" HOME_QUOTA "none"
 
 # ── Destruction confirmation ──────────────────────────────────────────────────
 echo ""
@@ -185,8 +249,12 @@ echo -e "  Timezone:    ${BOLD}${TIMEZONE}${RESET}"
 echo -e "  Swap:        ${BOLD}${SWAP_SIZE}${RESET} zvol on rpool"
 echo -e "  /home quota: ${BOLD}${HOME_QUOTA}${RESET}"
 echo ""
-read -rp "$(echo -e "${RED}${BOLD}Type YES (all caps) to proceed, anything else to abort: ${RESET}")" _CONFIRM
-[[ "${_CONFIRM}" == "YES" ]] || { echo "Aborted."; exit 0; }
+if [[ "${AUTO_CONFIRM}" == "yes" ]]; then
+    warn "--yes flag set: skipping confirmation prompt"
+else
+    read -rp "$(echo -e "${RED}${BOLD}Type YES (all caps) to proceed, anything else to abort: ${RESET}")" _CONFIRM
+    [[ "${_CONFIRM}" == "YES" ]] || { echo "Aborted."; exit 0; }
+fi
 
 # ── Tear down any previous run ─────────────────────────────────────────────────
 banner "Clearing any previous state"
