@@ -48,6 +48,18 @@ UBUNTU_KEYRING="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 # ── Root guard ────────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "Must run as root. Try: sudo bash $0"
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+# All console output is transparently duplicated to the log file via tee.
+# Verbose command output (e.g. cdebootstrap --verbose) is also sent there.
+# Console appearance is unchanged — tee passes stdout/stderr through as-is.
+LOG=/var/log/os-install.log
+mkdir -p /var/log
+printf '\n%s\n' "$(printf '=%.0s' {1..60})" >> "${LOG}"
+printf '[%s] install-ubuntu-zfs.sh started (PID %s)\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "${LOG}"
+# Duplicate stdout → tee → log; merge stderr into the same stream.
+exec > >(tee -a "${LOG}") 2>&1
+
 # ── Prerequisite check & auto-install ────────────────────────────────────────
 banner "Checking prerequisites"
 
@@ -59,12 +71,15 @@ for cmd_pkg in \
     "partprobe:parted" \
     "mkfs.vfat:dosfstools" \
     "efibootmgr:efibootmgr" \
-    "bootctl:systemd-boot-efi" \
     "curl:curl" \
     "gpg:gnupg"; do
     cmd="${cmd_pkg%%:*}"; pkg="${cmd_pkg##*:}"
     command -v "$cmd" &>/dev/null || NEEDED_PKGS+=("$pkg")
 done
+# systemd-boot and its EFI stubs are needed to run `bootctl install` from the live env.
+# bootctl is always present (from systemd) but the EFI stub files may not be — install
+# both packages unconditionally.
+NEEDED_PKGS+=(systemd-boot systemd-boot-efi)
 
 if [[ ${#NEEDED_PKGS[@]} -gt 0 ]]; then
     info "Installing missing live-environment packages: ${NEEDED_PKGS[*]}"
@@ -112,13 +127,22 @@ echo -e "${BOLD}Ubuntu codename${RESET}"
 echo -e "  Verify 26.04's codename on a running system: lsb_release -cs"
 _prompt "Ubuntu codename" UBUNTU_CODENAME "noble"
 _prompt  "Hostname"                    HOSTNAME_NEW   "ubuntu-server"
-_prompt  "New (non-root) username"     NEW_USER
-# Validate before any destructive operations — reject slashes/spaces/special chars
-# that could cause path traversal in sudoers.d or malformed useradd calls.
-[[ "${NEW_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
-    die "Invalid username '${NEW_USER}': use 1-31 chars, start with [a-z_], contain only [a-z0-9_-]"
-_prompt_pw "Password for ${NEW_USER}"  USER_PASSWORD
-_prompt_pw "Root password"             ROOT_PASSWORD
+read -rp "$(echo -e "${YELLOW}Add a non-root user? [Y/n]: ${RESET}")" _ADD_USER_REPLY
+if [[ "${_ADD_USER_REPLY,,}" != "n" ]]; then
+    ADD_USER=yes
+    _prompt "New (non-root) username" NEW_USER
+    # Validate before any destructive operations — reject slashes/spaces/special chars
+    # that could cause path traversal in sudoers.d or malformed useradd calls.
+    [[ "${NEW_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
+        die "Invalid username '${NEW_USER}': use 1-31 chars, start with [a-z_], contain only [a-z0-9_-]"
+    _prompt_pw "Password for ${NEW_USER}" USER_PASSWORD
+    ROOT_PASSWORD=""
+else
+    ADD_USER=no
+    NEW_USER=""
+    USER_PASSWORD=""
+    _prompt_pw "Root password" ROOT_PASSWORD
+fi
 echo -e "${YELLOW}Timezone — e.g. UTC, America/Chicago, Europe/London${RESET}"
 _prompt  "Timezone"    TIMEZONE  "UTC"
 echo -e "${YELLOW}Locale — e.g. en_US.UTF-8, en_GB.UTF-8${RESET}"
@@ -145,7 +169,11 @@ echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo -e "  Disk:        ${BOLD}${TARGET_DISK}${RESET}  ($(lsblk -dno SIZE "${TARGET_DISK}") total)"
 echo -e "  Hostname:    ${BOLD}${HOSTNAME_NEW}${RESET}"
-echo -e "  User:        ${BOLD}${NEW_USER}${RESET}"
+if [[ "${ADD_USER}" == "yes" ]]; then
+    echo -e "  User:        ${BOLD}${NEW_USER}${RESET}  (root remains locked)"
+else
+    echo -e "  Access:      ${BOLD}root password login${RESET}  (no non-root user)"
+fi
 echo -e "  Ubuntu:      ${BOLD}${UBUNTU_CODENAME}${RESET}"
 echo -e "  Timezone:    ${BOLD}${TIMEZONE}${RESET}"
 echo -e "  Swap:        ${BOLD}${SWAP_SIZE}${RESET} zvol on rpool"
@@ -430,13 +458,20 @@ KEYRING_FLAG=()
 [[ -n "${UBUNTU_KEYRING}" && -f "${UBUNTU_KEYRING}" ]] && \
     KEYRING_FLAG=(--keyring="${UBUNTU_KEYRING}")
 
+# Run with --verbose so all I:/W:/P: lines appear in the log.
+# On console we filter to P: (progress) only — same as before.
+# PIPESTATUS[0] captures cdebootstrap's exit code through the pipe.
+info "Verbose cdebootstrap output is being logged to ${LOG}"
 cdebootstrap \
+    --verbose \
     "${KEYRING_FLAG[@]}" \
     --flavour=standard \
     --include=locales,apt-utils,gpg,gpg-agent,ca-certificates,ubuntu-keyring \
     "${UBUNTU_CODENAME}" \
     "${POOL_ROOT}" \
-    "${UBUNTU_MIRROR}"
+    "${UBUNTU_MIRROR}" \
+    2>&1 | tee -a "${LOG}" | grep --line-buffered -E '^P:' || true
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || die "cdebootstrap failed — see ${LOG} for details"
 
 success "cdebootstrap complete"
 
@@ -643,6 +678,7 @@ chroot "${POOL_ROOT}" /usr/bin/env -i \
     TERM="${TERM:-xterm-256color}" \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     DEBIAN_FRONTEND=noninteractive \
+    ADD_USER="${ADD_USER}" \
     NEW_USER="${NEW_USER}" \
     TIMEZONE="${TIMEZONE}" \
     LOCALE="${LOCALE}" \
@@ -877,22 +913,21 @@ ci "Enabling and hardening SSH..."
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 systemctl enable ssh
 
-# ── Root password ─────────────────────────────────────────────────────────────
-# Password is set via pipe from OUTSIDE the chroot (see post-chroot block)
-# to avoid exposing it in /proc/<pid>/environ.
-ci "Root password will be set after chroot via external chpasswd call"
-
-# ── User account ──────────────────────────────────────────────────────────────
-ci "Creating user: ${NEW_USER}"
-useradd -m -s /bin/bash -G sudo,adm,audio,video,plugdev,netdev "${NEW_USER}"
-# Password set externally — see post-chroot block
-echo "${NEW_USER} ALL=(ALL:ALL) ALL" > "/etc/sudoers.d/${NEW_USER}"
-chmod 440 "/etc/sudoers.d/${NEW_USER}"
-if ! visudo -c -f "/etc/sudoers.d/${NEW_USER}" 2>/dev/null; then
-    rm -f "/etc/sudoers.d/${NEW_USER}"
-    die "sudoers.d/${NEW_USER} failed visudo validation — file removed to prevent sudo lockout"
+# ── User account / root access ────────────────────────────────────────────────
+# Passwords are set via pipe from OUTSIDE the chroot after this block completes.
+if [[ "${ADD_USER}" == "yes" ]]; then
+    ci "Creating user: ${NEW_USER}"
+    useradd -m -s /bin/bash -G sudo,adm,audio,video,plugdev,netdev "${NEW_USER}"
+    echo "${NEW_USER} ALL=(ALL:ALL) ALL" > "/etc/sudoers.d/${NEW_USER}"
+    chmod 440 "/etc/sudoers.d/${NEW_USER}"
+    if ! visudo -c -f "/etc/sudoers.d/${NEW_USER}" 2>/dev/null; then
+        rm -f "/etc/sudoers.d/${NEW_USER}"
+        die "sudoers.d/${NEW_USER} failed visudo validation — file removed to prevent sudo lockout"
+    fi
+    cok "User ${NEW_USER} created (password set after chroot; root remains locked)"
+else
+    ci "No non-root user requested — root password will be set after chroot"
 fi
-cok "User ${NEW_USER} created (password set after chroot)"
 
 # ── machine-id ────────────────────────────────────────────────────────────────
 [[ -s /etc/machine-id ]] || systemd-machine-id-setup 2>/dev/null || true
@@ -924,11 +959,15 @@ success "Chroot configuration complete"
 
 # ── Set passwords via pipe — never exposed in /proc environ ──────────────────
 banner "Setting passwords"
-info "Setting root password..."
-printf 'root:%s\n' "${ROOT_PASSWORD}" | chroot "${POOL_ROOT}" chpasswd
-info "Setting ${NEW_USER} password..."
-printf '%s:%s\n' "${NEW_USER}" "${USER_PASSWORD}" | chroot "${POOL_ROOT}" chpasswd
-success "Passwords set"
+if [[ "${ADD_USER}" == "yes" ]]; then
+    info "Setting ${NEW_USER} password..."
+    printf '%s:%s\n' "${NEW_USER}" "${USER_PASSWORD}" | chroot "${POOL_ROOT}" chpasswd
+    success "${NEW_USER} password set; root account remains locked"
+else
+    info "Setting root password..."
+    printf 'root:%s\n' "${ROOT_PASSWORD}" | chroot "${POOL_ROOT}" chpasswd
+    success "Root password set"
+fi
 
 # ── Tear down bind mounts ─────────────────────────────────────────────────────
 banner "Unmounting virtual filesystems"
@@ -946,7 +985,11 @@ echo -e "  ${BOLD}EFI:${RESET}           ${EFI_PART}"
 echo -e "  ${BOLD}bpool:${RESET}         ${BPOOL_PART}  →  /boot"
 echo -e "  ${BOLD}rpool:${RESET}         ${RPOOL_PART}  →  /"
 echo -e "  ${BOLD}Hostname:${RESET}      ${HOSTNAME_NEW}"
-echo -e "  ${BOLD}User:${RESET}          ${NEW_USER}"
+if [[ "${ADD_USER}" == "yes" ]]; then
+    echo -e "  ${BOLD}User:${RESET}          ${NEW_USER}  (root locked)"
+else
+    echo -e "  ${BOLD}Access:${RESET}        root password login"
+fi
 echo -e "  ${BOLD}Ubuntu:${RESET}        ${UBUNTU_CODENAME}"
 echo -e "  ${BOLD}Timezone:${RESET}      ${TIMEZONE}  /  Locale: ${LOCALE}"
 echo -e "  ${BOLD}Swap:${RESET}          ${SWAP_SIZE} zvol on rpool"
@@ -976,7 +1019,11 @@ echo    "     sudo apt-get install --reinstall bash   # triggers pre/post snapsh
 echo    "     sudo zfs list -t snapshot | grep apt"
 echo ""
 echo -e "  ${BOLD}4. Harden SSH (if not already done)${RESET}"
-echo    "     Add your public key:  ssh-copy-id ${NEW_USER}@${HOSTNAME_NEW}"
+if [[ "${ADD_USER}" == "yes" ]]; then
+    echo    "     Add your public key:  ssh-copy-id ${NEW_USER}@${HOSTNAME_NEW}"
+else
+    echo    "     Add your public key:  ssh-copy-id root@${HOSTNAME_NEW}"
+fi
 echo    "     Then disable password auth in /etc/ssh/sshd_config:"
 echo    "       PasswordAuthentication no"
 echo    "       PubkeyAuthentication yes"
