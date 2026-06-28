@@ -511,6 +511,7 @@ info "mmdebstrap output is being logged to ${LOG}"
 mmdebstrap \
     "${KEYRING_FLAG[@]}" \
     --variant=standard \
+    --skip=check \
     --include=locales,apt-utils,gpg,gpg-agent,ca-certificates,ubuntu-keyring \
     "${UBUNTU_CODENAME}" \
     "${POOL_ROOT}" \
