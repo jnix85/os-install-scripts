@@ -82,8 +82,7 @@ Usage: sudo bash $0 [OPTIONS]
   --no-user              No non-root user; set root password instead
   --root-password PASS   Root password (only used with --no-user)
   --timezone  TZ         Timezone (e.g. UTC, America/Chicago)
-  --locale    LOCALE     Locale (e.g. en_US.UTF-8)
-  --home-quota SIZE      ZFS quota for /home (e.g. 200G, 1T, none)
+  --quota     SIZE       ZFS quota for /home (e.g. 200G, 1T, none)
   --yes                  Skip the YES confirmation prompt (dangerous!)
   -h, --help             Show this help
 
@@ -103,7 +102,7 @@ NEW_USER=""
 USER_PASSWORD=""
 ROOT_PASSWORD=""
 TIMEZONE="${TIMEZONE:-}"
-LOCALE="${LOCALE:-}"
+LOCALE="en_US.UTF-8"
 HOME_QUOTA="${HOME_QUOTA:-}"
 AUTO_CONFIRM=no
 
@@ -117,8 +116,7 @@ while [[ $# -gt 0 ]]; do
         --no-user)            ADD_USER=no;             shift   ;;
         --root-password)      ROOT_PASSWORD="$2";     shift 2 ;;
         --timezone)           TIMEZONE="$2";          shift 2 ;;
-        --locale)             LOCALE="$2";            shift 2 ;;
-        --home-quota)         HOME_QUOTA="$2";        shift 2 ;;
+        --quota)              HOME_QUOTA="$2";        shift 2 ;;
         --yes|-y)             AUTO_CONFIRM=yes;        shift   ;;
         -h|--help)            _usage ;;
         *) die "Unknown flag: $1  (run with --help for usage)" ;;
@@ -216,9 +214,7 @@ else
 fi
 
 echo -e "${YELLOW}Timezone — e.g. UTC, America/Chicago, Europe/London${RESET}"
-[[ -n "${TIMEZONE}"    ]] || _prompt "Timezone" TIMEZONE "UTC"
-echo -e "${YELLOW}Locale — e.g. en_US.UTF-8, en_GB.UTF-8${RESET}"
-[[ -n "${LOCALE}"      ]] || _prompt "Locale"   LOCALE   "en_US.UTF-8"
+[[ -n "${TIMEZONE}" ]] || _prompt "Timezone" TIMEZONE "UTC"
 # Auto-size swap: equal to RAM up to 8G, half RAM up to 32G, capped at 16G above that.
 # Supports hibernate when RAM ≤ 8G; sensible overhead above that.
 _ram_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
@@ -247,7 +243,7 @@ fi
 echo -e "  Ubuntu:      ${BOLD}${UBUNTU_CODENAME}${RESET}"
 echo -e "  Timezone:    ${BOLD}${TIMEZONE}${RESET}"
 echo -e "  Swap:        ${BOLD}${SWAP_SIZE}${RESET} zvol on rpool"
-echo -e "  /home quota: ${BOLD}${HOME_QUOTA}${RESET}"
+echo -e "  /home quota: ${BOLD}${HOME_QUOTA}${RESET}  /  Locale: ${LOCALE}"
 echo ""
 if [[ "${AUTO_CONFIRM}" == "yes" ]]; then
     warn "--yes flag set: skipping confirmation prompt"
@@ -1062,7 +1058,7 @@ else
     echo -e "  ${BOLD}Access:${RESET}        root password login"
 fi
 echo -e "  ${BOLD}Ubuntu:${RESET}        ${UBUNTU_CODENAME}"
-echo -e "  ${BOLD}Timezone:${RESET}      ${TIMEZONE}  /  Locale: ${LOCALE}"
+echo -e "  ${BOLD}Timezone:${RESET}      ${TIMEZONE}  /  Locale: ${LOCALE} (hardcoded)"
 echo -e "  ${BOLD}Swap:${RESET}          ${SWAP_SIZE} zvol on rpool"
 echo -e "  ${BOLD}Bootloader:${RESET}    systemd-boot → ZFSBootMenu (kexec) → kernel"
 echo -e "  ${BOLD}Snapshots:${RESET}     sanoid.timer + apt pre/post hooks"
