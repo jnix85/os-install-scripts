@@ -131,7 +131,7 @@ banner "Checking prerequisites"
 
 NEEDED_PKGS=()
 for cmd_pkg in \
-    "mmdebstrap:mmdebstrap" \
+    "debootstrap:debootstrap" \
     "zpool:zfsutils-linux" \
     "sgdisk:gdisk" \
     "partprobe:parted" \
@@ -495,34 +495,28 @@ info "ZFS mount layout:"
 zfs list -r -o name,mountpoint,canmount 2>/dev/null "${RPOOL}" "${BPOOL}" || true
 echo ""
 
-# ── mmdebstrap ───────────────────────────────────────────────────────────────
-# mmdebstrap replaces cdebootstrap: it uses apt internally and handles modern
-# Ubuntu package formats (including 26.04/resolute) correctly. cdebootstrap 0.7.x
-# has an infinite-loop bug parsing certain 26.04 packages (e.g. gcc-16-base).
-# NOTE: mmdebstrap requires an empty target — zpool.cache, zfs-list.cache, and the
-# EFI mount are all deferred to after the bootstrap for this reason.
-banner "Running mmdebstrap — ${UBUNTU_CODENAME}"
+# ── debootstrap ──────────────────────────────────────────────────────────────
+# debootstrap handles Ubuntu 26.04 packages correctly and, unlike mmdebstrap,
+# does not require the target directory to be empty — so it works fine with
+# ZFS child datasets already mounted at sub-paths of POOL_ROOT.
+banner "Running debootstrap — ${UBUNTU_CODENAME}"
 
 KEYRING_FLAG=()
 [[ -n "${UBUNTU_KEYRING}" && -f "${UBUNTU_KEYRING}" ]] && \
     KEYRING_FLAG=(--keyring="${UBUNTU_KEYRING}")
 
-info "mmdebstrap output is being logged to ${LOG}"
-mmdebstrap \
+info "debootstrap output is being logged to ${LOG}"
+debootstrap \
     "${KEYRING_FLAG[@]}" \
-    --variant=standard \
-    --skip=check \
     --include=locales,apt-utils,gpg,gpg-agent,ca-certificates,ubuntu-keyring \
     "${UBUNTU_CODENAME}" \
     "${POOL_ROOT}" \
     "${UBUNTU_MIRROR}" \
-    || die "mmdebstrap failed — see ${LOG} for details"
+    || die "debootstrap failed — see ${LOG} for details"
 
-success "mmdebstrap complete"
+success "debootstrap complete"
 
 # ── Post-bootstrap: ZFS cache files + EFI mount ───────────────────────────────
-# These are done after mmdebstrap so the target directory is empty when mmdebstrap
-# runs (it refuses to write into a non-empty directory).
 mkdir -p "${POOL_ROOT}/etc/zfs"
 cp /etc/zfs/zpool.cache "${POOL_ROOT}/etc/zfs/zpool.cache"
 success "ZFS pool cache written to ${POOL_ROOT}/etc/zfs/zpool.cache"
