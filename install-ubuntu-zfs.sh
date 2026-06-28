@@ -266,22 +266,29 @@ fi
 
 # ── Tear down any previous run ─────────────────────────────────────────────────
 banner "Clearing any previous state"
-# Unmount anything under POOL_ROOT first, then export pools.
-# IMPORTANT: we must confirm each pool is actually unexported before proceeding
-# to wipefs — wiping a disk that backs an active imported pool corrupts the pool
-# and can crash the kernel ZFS module.
-if mountpoint -q "${POOL_ROOT}" 2>/dev/null; then
-    info "Unmounting ${POOL_ROOT}..."
-    umount -Rl "${POOL_ROOT}" 2>/dev/null || true
-fi
+# Unmount everything under POOL_ROOT before exporting pools.
+# Order matters: bind mounts (resolv.conf, EFI, vfs) must come off before the
+# ZFS datasets underneath them, otherwise zpool export sees the pool as busy.
+for _bm in \
+    "${POOL_ROOT}/etc/resolv.conf" \
+    "${POOL_ROOT}/boot/efi" \
+    "${POOL_ROOT}/dev/pts" \
+    "${POOL_ROOT}/dev" \
+    "${POOL_ROOT}/proc" \
+    "${POOL_ROOT}/sys" \
+    "${POOL_ROOT}/run"; do
+    umount "${_bm}" 2>/dev/null || true
+done
+zfs unmount -a 2>/dev/null || true
+umount -Rl "${POOL_ROOT}" 2>/dev/null || true
+
 for _stale_pool in "${BPOOL}" "${RPOOL}"; do
     if zpool list "${_stale_pool}" &>/dev/null; then
         info "Exporting stale pool: ${_stale_pool}"
-        # Retry once after a forced recursive unmount in case something is still busy
         if ! zpool export "${_stale_pool}" 2>/dev/null; then
-            zfs umount -a 2>/dev/null || true
-            zpool export "${_stale_pool}" || \
-                die "Pool '${_stale_pool}' is still active and cannot be exported. Aborting to prevent data loss. Run: zpool export ${_stale_pool}"
+            warn "Normal export failed — retrying with -f (force)"
+            zpool export -f "${_stale_pool}" || \
+                die "Pool '${_stale_pool}' could not be force-exported. Run: zpool export -f ${_stale_pool}"
         fi
         success "Exported ${_stale_pool}"
     fi
