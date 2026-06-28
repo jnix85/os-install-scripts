@@ -483,37 +483,12 @@ success "Swap zvol: /dev/zvol/${RPOOL}/swap  (${SWAP_SIZE})"
 mkdir -p /etc/zfs
 zpool set cachefile=/etc/zfs/zpool.cache "${RPOOL}"
 zpool set cachefile=/etc/zfs/zpool.cache "${BPOOL}"
-mkdir -p "${POOL_ROOT}/etc/zfs"
-cp /etc/zfs/zpool.cache "${POOL_ROOT}/etc/zfs/zpool.cache"
-success "ZFS pool cache written to ${POOL_ROOT}/etc/zfs/zpool.cache"
 
 # [Patch 1] Set ZFSBootMenu commandline property HERE in the live env where the
 # pool is actually imported. The same call inside the chroot is a no-op because
 # the chroot cannot see the imported pools.
 zfs set org.zfsbootmenu:commandline="" "${RPOOL}/ROOT/ubuntu"
 success "ZFSBootMenu commandline property set on ${RPOOL}/ROOT/ubuntu"
-
-# [Patch 3] Seed the zfs-mount-generator dataset cache from the live env.
-# zfs-mount-generator reads /etc/zfs/zfs-list.cache/<poolname> at boot to produce
-# deterministic systemd mount unit ordering. Without this file the generator skips
-# rpool entirely and mount order is non-deterministic.
-mkdir -p "${POOL_ROOT}/etc/zfs/zfs-list.cache"
-zfs list -H -t filesystem \
-    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand \
-    2>/dev/null \
-    | grep "^${RPOOL}" \
-    > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL}" || true
-success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL})"
-zfs list -H -t filesystem \
-    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand \
-    2>/dev/null \
-    | grep "^${BPOOL}" \
-    > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL}" || true
-success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL})"
-
-# ── Mount EFI partition ────────────────────────────────────────────────────────
-mkdir -p "${POOL_ROOT}/boot/efi"
-mount "${EFI_PART}" "${POOL_ROOT}/boot/efi"
 
 success "All datasets created and mounted"
 info "ZFS mount layout:"
@@ -524,6 +499,8 @@ echo ""
 # mmdebstrap replaces cdebootstrap: it uses apt internally and handles modern
 # Ubuntu package formats (including 26.04/resolute) correctly. cdebootstrap 0.7.x
 # has an infinite-loop bug parsing certain 26.04 packages (e.g. gcc-16-base).
+# NOTE: mmdebstrap requires an empty target — zpool.cache, zfs-list.cache, and the
+# EFI mount are all deferred to after the bootstrap for this reason.
 banner "Running mmdebstrap — ${UBUNTU_CODENAME}"
 
 KEYRING_FLAG=()
@@ -541,6 +518,30 @@ mmdebstrap \
     || die "mmdebstrap failed — see ${LOG} for details"
 
 success "mmdebstrap complete"
+
+# ── Post-bootstrap: ZFS cache files + EFI mount ───────────────────────────────
+# These are done after mmdebstrap so the target directory is empty when mmdebstrap
+# runs (it refuses to write into a non-empty directory).
+mkdir -p "${POOL_ROOT}/etc/zfs"
+cp /etc/zfs/zpool.cache "${POOL_ROOT}/etc/zfs/zpool.cache"
+success "ZFS pool cache written to ${POOL_ROOT}/etc/zfs/zpool.cache"
+
+# [Patch 3] Seed the zfs-mount-generator dataset cache from the live env.
+mkdir -p "${POOL_ROOT}/etc/zfs/zfs-list.cache"
+zfs list -H -t filesystem \
+    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand \
+    2>/dev/null | grep "^${RPOOL}" \
+    > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL}" || true
+success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL})"
+zfs list -H -t filesystem \
+    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand \
+    2>/dev/null | grep "^${BPOOL}" \
+    > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL}" || true
+success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL})"
+
+mkdir -p "${POOL_ROOT}/boot/efi"
+mount "${EFI_PART}" "${POOL_ROOT}/boot/efi"
+success "EFI partition mounted at ${POOL_ROOT}/boot/efi"
 
 # ── Write configuration files into the target ─────────────────────────────────
 banner "Writing configuration files"
