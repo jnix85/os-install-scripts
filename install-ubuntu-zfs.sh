@@ -123,8 +123,15 @@ echo -e "${YELLOW}Timezone — e.g. UTC, America/Chicago, Europe/London${RESET}"
 _prompt  "Timezone"    TIMEZONE  "UTC"
 echo -e "${YELLOW}Locale — e.g. en_US.UTF-8, en_GB.UTF-8${RESET}"
 _prompt  "Locale"      LOCALE    "en_US.UTF-8"
-echo -e "${YELLOW}Swap zvol size — e.g. 4G, 8G, 16G${RESET}"
-_prompt  "Swap size"   SWAP_SIZE "8G"
+# Auto-size swap: equal to RAM up to 8G, half RAM up to 32G, capped at 16G above that.
+# Supports hibernate when RAM ≤ 8G; sensible overhead above that.
+_ram_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+_ram_gb=$(( (_ram_kb + 1048575) / 1048576 ))
+if   (( _ram_gb <= 8  )); then SWAP_SIZE="${_ram_gb}G"
+elif (( _ram_gb <= 32 )); then SWAP_SIZE="$(( (_ram_gb + 1) / 2 ))G"
+else                           SWAP_SIZE="16G"
+fi
+info "Detected ${_ram_gb}G RAM → swap zvol auto-sized to ${SWAP_SIZE}"
 echo -e "${YELLOW}/home total quota — ZFS size (e.g. 200G, 1T) or 'none'${RESET}"
 _prompt  "/home quota" HOME_QUOTA "none"
 
@@ -399,6 +406,12 @@ zfs list -H -t filesystem \
     | grep "^${RPOOL}" \
     > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL}" || true
 success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${RPOOL})"
+zfs list -H -t filesystem \
+    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand \
+    2>/dev/null \
+    | grep "^${BPOOL}" \
+    > "${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL}" || true
+success "ZFS mount-generator cache seeded (${POOL_ROOT}/etc/zfs/zfs-list.cache/${BPOOL})"
 
 # ── Mount EFI partition ────────────────────────────────────────────────────────
 mkdir -p "${POOL_ROOT}/boot/efi"
@@ -449,11 +462,15 @@ UUID=${EFI_UUID}  /boot/efi  vfat  umask=0022,fmask=0022,dmask=0022  0  1
 /dev/zvol/${RPOOL}/swap  none  swap  defaults  0  0
 FSTAB
 
-cat > "${POOL_ROOT}/etc/apt/sources.list" <<SOURCES
-deb ${UBUNTU_MIRROR} ${UBUNTU_CODENAME} main restricted universe multiverse
-deb ${UBUNTU_MIRROR} ${UBUNTU_CODENAME}-updates main restricted universe multiverse
-deb ${UBUNTU_MIRROR} ${UBUNTU_CODENAME}-security main restricted universe multiverse
-deb ${UBUNTU_MIRROR} ${UBUNTU_CODENAME}-backports main restricted universe multiverse
+# DEB822 format (required for Ubuntu 24.04+; legacy sources.list is deprecated)
+> "${POOL_ROOT}/etc/apt/sources.list"   # empty the legacy file to suppress warnings
+mkdir -p "${POOL_ROOT}/etc/apt/sources.list.d"
+cat > "${POOL_ROOT}/etc/apt/sources.list.d/ubuntu.sources" <<SOURCES
+Types: deb
+URIs: ${UBUNTU_MIRROR}
+Suites: ${UBUNTU_CODENAME} ${UBUNTU_CODENAME}-updates ${UBUNTU_CODENAME}-security ${UBUNTU_CODENAME}-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
 
 cat > "${POOL_ROOT}/etc/locale.gen" <<LOCALEGEN
@@ -609,7 +626,11 @@ mount --make-private --rbind /dev  "${POOL_ROOT}/dev"
 mount --make-private --rbind /proc "${POOL_ROOT}/proc"
 mount --make-private --rbind /sys  "${POOL_ROOT}/sys"
 mount --make-private --rbind /run  "${POOL_ROOT}/run"
-cp /etc/resolv.conf "${POOL_ROOT}/etc/resolv.conf"
+# Bind-mount rather than copy so the live system's DNS works during the chroot
+# install without leaving a stale file on the target; NetworkManager/systemd-resolved
+# will manage resolv.conf on first real boot.
+touch "${POOL_ROOT}/etc/resolv.conf"
+mount --bind /etc/resolv.conf "${POOL_ROOT}/etc/resolv.conf"
 success "Virtual filesystems bound"
 
 # ── Chroot ────────────────────────────────────────────────────────────────────
@@ -867,6 +888,10 @@ useradd -m -s /bin/bash -G sudo,adm,audio,video,plugdev,netdev "${NEW_USER}"
 # Password set externally — see post-chroot block
 echo "${NEW_USER} ALL=(ALL:ALL) ALL" > "/etc/sudoers.d/${NEW_USER}"
 chmod 440 "/etc/sudoers.d/${NEW_USER}"
+if ! visudo -c -f "/etc/sudoers.d/${NEW_USER}" 2>/dev/null; then
+    rm -f "/etc/sudoers.d/${NEW_USER}"
+    die "sudoers.d/${NEW_USER} failed visudo validation — file removed to prevent sudo lockout"
+fi
 cok "User ${NEW_USER} created (password set after chroot)"
 
 # ── machine-id ────────────────────────────────────────────────────────────────
@@ -907,6 +932,7 @@ success "Passwords set"
 
 # ── Tear down bind mounts ─────────────────────────────────────────────────────
 banner "Unmounting virtual filesystems"
+umount "${POOL_ROOT}/etc/resolv.conf" 2>/dev/null || true
 umount -Rl "${POOL_ROOT}/run"  2>/dev/null || true
 umount -Rl "${POOL_ROOT}/sys"  2>/dev/null || true
 umount -Rl "${POOL_ROOT}/proc" 2>/dev/null || true
@@ -932,6 +958,37 @@ zfs list -r -o name,used,avail,mountpoint,canmount 2>/dev/null \
     "${RPOOL}" "${BPOOL}" || true
 echo ""
 
+# ── First-boot checklist ──────────────────────────────────────────────────────
+echo -e "${BOLD}${CYAN}━━━━━━━━━━  First-boot checklist  ━━━━━━━━━━${RESET}"
+echo ""
+echo -e "  ${BOLD}1. Verify ZFSBootMenu loads${RESET}"
+echo    "     Reboot → systemd-boot menu → ZFSBootMenu should appear."
+echo    "     If the ZBM EFI binary was not downloaded, place it at:"
+echo    "       /boot/efi/EFI/zbm/vmlinuz.EFI"
+echo    "     or run: generate-zbm  (if the apt package installed)"
+echo ""
+echo -e "  ${BOLD}2. Verify sanoid snapshots${RESET}"
+echo    "     sudo sanoid --cron --verbose"
+echo    "     sudo zfs list -t snapshot -r ${RPOOL}/ROOT/ubuntu"
+echo ""
+echo -e "  ${BOLD}3. Test apt snapshot hook${RESET}"
+echo    "     sudo apt-get install --reinstall bash   # triggers pre/post snapshots"
+echo    "     sudo zfs list -t snapshot | grep apt"
+echo ""
+echo -e "  ${BOLD}4. Harden SSH (if not already done)${RESET}"
+echo    "     Add your public key:  ssh-copy-id ${NEW_USER}@${HOSTNAME_NEW}"
+echo    "     Then disable password auth in /etc/ssh/sshd_config:"
+echo    "       PasswordAuthentication no"
+echo    "       PubkeyAuthentication yes"
+echo ""
+echo -e "  ${BOLD}5. Check ZFS pool health${RESET}"
+echo    "     zpool status"
+echo    "     zpool list"
+echo ""
+echo -e "  ${BOLD}6. Verify bpool imports at boot${RESET}"
+echo    "     systemctl status zfs-import-bpool.service"
+echo ""
+
 # ── Enter chroot or finish ────────────────────────────────────────────────────
 banner "What would you like to do?"
 echo "  1)  Enter interactive chroot — verify, make additional changes"
@@ -948,6 +1005,7 @@ _rebind() {
 }
 
 _unbind() {
+    umount "${POOL_ROOT}/etc/resolv.conf" 2>/dev/null || true
     umount -Rl "${POOL_ROOT}/run"  2>/dev/null || true
     umount -Rl "${POOL_ROOT}/sys"  2>/dev/null || true
     umount -Rl "${POOL_ROOT}/proc" 2>/dev/null || true
