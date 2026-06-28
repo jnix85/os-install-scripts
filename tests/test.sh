@@ -153,14 +153,14 @@ else
         "$(_exit --release resolute --hostname h --user 'BAD USER' \
             --password x --timezone UTC --quota none --yes 2>/dev/null || echo $?)"
 
-    # Valid args make it past validation (debootstrap stub exits 0 so install
-    # proceeds until it hits something hardware-specific)
+    # Valid args make it past validation into execution (sgdisk mocks fire,
+    # then the script dies on missing real partitions — that's expected with mocks)
     _out=$(_run --release resolute --hostname testhost --user validuser \
                 --password testpass --timezone UTC --quota none --yes 2>&1 || true)
-    if echo "$_out" | grep -q "mock.*debootstrap\|debootstrap\|Running debootstrap"; then
-        _pass "valid args reach debootstrap phase"
+    if echo "$_out" | grep -q "mock.*sgdisk\|Partitioning\|Prerequisites satisfied"; then
+        _pass "valid args pass validation and enter execution"
     else
-        _fail "valid args reach debootstrap phase" "(debootstrap reached)" "$_out"
+        _fail "valid args pass validation and enter execution" "(partitioning reached)" "$_out"
     fi
 fi
 
