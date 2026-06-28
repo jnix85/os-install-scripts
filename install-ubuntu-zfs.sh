@@ -59,6 +59,12 @@ printf '[%s] install-ubuntu-zfs.sh started (PID %s)\n' \
     "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "${LOG}"
 # Duplicate stdout → tee → log; merge stderr into the same stream.
 exec > >(tee -a "${LOG}") 2>&1
+# Redirect xtrace (set -x) to the log file only — never to console.
+# BASH_XTRACEFD + set -x logs every command with timestamp and line number.
+exec 9>>"${LOG}"
+BASH_XTRACEFD=9
+PS4='+[%(%H:%M:%S)T][L${LINENO}] '
+set -x
 
 # ── Prerequisite check & auto-install ────────────────────────────────────────
 banner "Checking prerequisites"
