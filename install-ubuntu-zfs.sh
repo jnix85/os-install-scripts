@@ -1000,6 +1000,7 @@ fi
 # importing pools across different machines (or after a reinstall) produces
 # "hostid mismatch" warnings and may require `zpool import -f`.
 ci "Generating ZFS host ID (/etc/hostid)..."
+rm -f /etc/hostid
 if command -v zgenhostid &>/dev/null; then
     zgenhostid
     cok "Host ID generated: $(hostid)"
