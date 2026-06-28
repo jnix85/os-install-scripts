@@ -1,0 +1,7 @@
+sudo bash install-ubuntu-zfs.sh \
+  --release resolute \
+  --hostname myserver \
+  --user jason \
+  --password secret \
+  --timezone America/Chicago \
+  --yes
