@@ -466,7 +466,11 @@ KEYRING_FLAG=()
 
 # Run with --verbose so all I:/W:/P: lines appear in the log.
 # On console we filter to P: (progress) only — same as before.
-# PIPESTATUS[0] captures cdebootstrap's exit code through the pipe.
+# Run cdebootstrap with verbose output fully captured to log.
+# Console shows only P: (progress) lines — same appearance as before.
+# The brace group { grep || true; } keeps the pipeline's last stage exit=0 so
+# pipefail doesn't fire on grep. PIPESTATUS[0] is captured immediately after the
+# pipeline, before any subsequent command can overwrite it.
 info "Verbose cdebootstrap output is being logged to ${LOG}"
 cdebootstrap \
     --verbose \
@@ -476,8 +480,9 @@ cdebootstrap \
     "${UBUNTU_CODENAME}" \
     "${POOL_ROOT}" \
     "${UBUNTU_MIRROR}" \
-    2>&1 | tee -a "${LOG}" | grep --line-buffered -E '^P:' || true
-[[ "${PIPESTATUS[0]}" -eq 0 ]] || die "cdebootstrap failed — see ${LOG} for details"
+    2>&1 | tee -a "${LOG}" | { grep --line-buffered -E '^P:' || true; }
+_cdb_rc="${PIPESTATUS[0]}"
+[[ "${_cdb_rc}" -eq 0 ]] || die "cdebootstrap failed (rc=${_cdb_rc}) — see ${LOG} for details"
 
 success "cdebootstrap complete"
 
@@ -504,8 +509,8 @@ UUID=${EFI_UUID}  /boot/efi  vfat  umask=0022,fmask=0022,dmask=0022  0  1
 FSTAB
 
 # DEB822 format (required for Ubuntu 24.04+; legacy sources.list is deprecated)
-> "${POOL_ROOT}/etc/apt/sources.list"   # empty the legacy file to suppress warnings
 mkdir -p "${POOL_ROOT}/etc/apt/sources.list.d"
+> "${POOL_ROOT}/etc/apt/sources.list"   # empty the legacy file to suppress warnings
 cat > "${POOL_ROOT}/etc/apt/sources.list.d/ubuntu.sources" <<SOURCES
 Types: deb
 URIs: ${UBUNTU_MIRROR}
