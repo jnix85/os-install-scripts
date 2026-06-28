@@ -866,21 +866,27 @@ cok "sanoid.timer enabled"
 ci "Setting up ZFSBootMenu..."
 mkdir -p /boot/efi/EFI/zbm
 
-# Primary: download the pre-built EFI binary from the official GitHub release.
-# This is the most reliable path — no custom apt repo required.
+# Download the pre-built EFI binary from the official GitHub release.
+# The asset URL is read directly from the GitHub API response so it stays
+# correct across ZFSBootMenu releases regardless of filename changes.
 ZBM_API="https://api.github.com/repos/zbm-dev/zfsbootmenu/releases/latest"
-ZBM_VERSION=""
-if ZBM_VERSION="$(curl -fsSL "${ZBM_API}" 2>/dev/null \
-        | grep '"tag_name"' \
-        | sed 's/.*"v\([^"]*\)".*/\1/')"; then
-    ci "Latest ZFSBootMenu release: v${ZBM_VERSION}"
-    ZBM_URL="https://github.com/zbm-dev/zfsbootmenu/releases/download/v${ZBM_VERSION}/zfsbootmenu-release-x86_64-v${ZBM_VERSION}.EFI"
+ZBM_EFI_REL=""
+ZBM_TMP="$(mktemp /tmp/zbm-efi.XXXXXX)"
+ZBM_SHA_TMP="$(mktemp /tmp/zbm-sha.XXXXXX)"
+
+_zbm_api_json="$(curl -fsSL "${ZBM_API}" 2>/dev/null)" || _zbm_api_json=""
+if [[ -n "${_zbm_api_json}" ]]; then
+    ZBM_VERSION="$(echo "${_zbm_api_json}" | grep '"tag_name"' \
+        | sed 's/.*"v\([^"]*\)".*/\1/' | head -1)"
+    # Extract the release EFI URL — prefer highest kernel version via sort -V.
+    # "release" builds are the standard boot image; "recovery" builds include
+    # extra rescue tools but are larger and unnecessary here.
+    ZBM_URL="$(echo "${_zbm_api_json}" | grep '"browser_download_url"' \
+        | grep 'release.*x86_64.*\.EFI"' | grep -v '\.sha256"' \
+        | awk -F'"' '{print $4}' | sort -V | tail -1)"
     ZBM_SHA_URL="${ZBM_URL}.sha256"
-    ZBM_TMP="$(mktemp /tmp/zbm-efi.XXXXXX)"
-    ZBM_SHA_TMP="$(mktemp /tmp/zbm-sha.XXXXXX)"
-    _zbm_ok=0
-    if curl -fsSL --progress-bar -o "${ZBM_TMP}" "${ZBM_URL}"; then
-        # Verify SHA256 checksum from the companion .sha256 release asset
+    ci "Latest ZFSBootMenu release: v${ZBM_VERSION} — ${ZBM_URL##*/}"
+    if [[ -n "${ZBM_URL}" ]] && curl -fsSL --progress-bar -o "${ZBM_TMP}" "${ZBM_URL}" 2>/dev/null; then
         if curl -fsSL -o "${ZBM_SHA_TMP}" "${ZBM_SHA_URL}" 2>/dev/null; then
             EXPECTED_HASH="$(awk '{print $1}' "${ZBM_SHA_TMP}")"
             ACTUAL_HASH="$(sha256sum "${ZBM_TMP}" | awk '{print $1}')"
@@ -888,71 +894,23 @@ if ZBM_VERSION="$(curl -fsSL "${ZBM_API}" 2>/dev/null \
                 cok "ZFSBootMenu EFI checksum verified (SHA256: ${ACTUAL_HASH:0:16}...)"
                 mv "${ZBM_TMP}" /boot/efi/EFI/zbm/vmlinuz.EFI
                 ZBM_EFI_REL="/EFI/zbm/vmlinuz.EFI"
-                _zbm_ok=1
             else
                 cw "ZFSBootMenu EFI checksum MISMATCH — discarding download"
                 cw "  Expected: ${EXPECTED_HASH}"
                 cw "  Got:      ${ACTUAL_HASH}"
             fi
         else
-            cw "Could not download checksum file (${ZBM_SHA_URL})"
-            cw "Proceeding with unverified binary — review manually before trusting this system"
+            cw "Checksum file unavailable — installing unverified binary"
             mv "${ZBM_TMP}" /boot/efi/EFI/zbm/vmlinuz.EFI
             ZBM_EFI_REL="/EFI/zbm/vmlinuz.EFI"
-            _zbm_ok=1
         fi
     else
-        cw "Binary download failed."
-    fi
-    rm -f "${ZBM_TMP}" "${ZBM_SHA_TMP}"
-    [[ "${_zbm_ok}" -eq 0 ]] && ZBM_EFI_REL="" || true
-else
-    cw "Could not query GitHub API."
-    ZBM_EFI_REL=""
-fi
-
-# Secondary: try the ZFSBootMenu apt repo to get generate-zbm for future use.
-# Failure here is not fatal — the downloaded EFI binary is what boots the system.
-ci "Attempting to install zfsbootmenu package (for future generate-zbm use)..."
-mkdir -p /etc/apt/keyrings
-if curl -fsSL https://get.zfsbootmenu.org/package.gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/zfsbootmenu.gpg 2>/dev/null; then
-    # Print the imported key fingerprint so the operator can verify it against
-    # the official ZFSBootMenu security page:
-    # https://github.com/zbm-dev/zfsbootmenu/blob/master/README.md (Security section)
-    ZBM_KEY_FP="$(gpg --no-default-keyring \
-        --keyring /etc/apt/keyrings/zfsbootmenu.gpg \
-        --fingerprint 2>/dev/null | grep -A1 'pub' | tail -1 | tr -d ' ')"
-    cw "ZFSBootMenu GPG key fingerprint: ${ZBM_KEY_FP}"
-    cw "Verify this matches the official fingerprint before trusting this repo."
-fi
-if [[ -f /etc/apt/keyrings/zfsbootmenu.gpg ]] && \
-   echo "deb [signed-by=/etc/apt/keyrings/zfsbootmenu.gpg] https://get.zfsbootmenu.org/apt /" \
-        > /etc/apt/sources.list.d/zfsbootmenu.list && \
-   apt-get update -qq 2>/dev/null && \
-   apt-get install -y zfsbootmenu 2>/dev/null; then
-    cok "zfsbootmenu package installed (generate-zbm available for future rebuilds)"
-    # If we didn't get the binary above, try generating it now
-    if [[ -z "${ZBM_EFI_REL}" ]]; then
-        ci "Running generate-zbm as fallback..."
-        if generate-zbm 2>/dev/null; then
-            # Avoid `ls *.EFI | head -1` — the glob fails under pipefail when
-            # no files exist, aborting the script. Use a safe loop instead.
-            ZBM_EFI=""
-            for _efi in /boot/efi/EFI/zbm/*.EFI; do
-                [[ -f "${_efi}" ]] && { ZBM_EFI="${_efi}"; break; }
-            done
-            ZBM_EFI_REL="${ZBM_EFI#/boot/efi}"
-            cok "generate-zbm succeeded: ${ZBM_EFI_REL}"
-        else
-            cw "generate-zbm also failed."
-        fi
+        cw "ZFSBootMenu EFI binary download failed."
     fi
 else
-    cw "ZFSBootMenu apt package unavailable — no generate-zbm installed."
-    cw "To rebuild ZBM images later, either install zfsbootmenu manually"
-    cw "or download a new EFI binary from https://github.com/zbm-dev/zfsbootmenu/releases"
+    cw "Could not reach GitHub API to find ZFSBootMenu release."
 fi
+rm -f "${ZBM_TMP}" "${ZBM_SHA_TMP}"
 
 if [[ -z "${ZBM_EFI_REL}" ]]; then
     cw "No ZFSBootMenu EFI binary available."
