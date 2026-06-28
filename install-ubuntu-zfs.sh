@@ -12,7 +12,7 @@
 #   - Swap zvol on rpool
 #   - Sanoid for scheduled snapshots + apt pre/post hooks
 #   - ZFSBootMenu booted via systemd-boot chainload
-#   - cdebootstrap for base OS install
+#   - mmdebstrap for base OS install
 #
 # NOTES:
 #   - Ubuntu 26.04 codename: verify with `lsb_release -cs`
@@ -71,7 +71,7 @@ banner "Checking prerequisites"
 
 NEEDED_PKGS=()
 for cmd_pkg in \
-    "cdebootstrap:cdebootstrap" \
+    "mmdebstrap:mmdebstrap" \
     "zpool:zfsutils-linux" \
     "sgdisk:gdisk" \
     "partprobe:parted" \
@@ -93,12 +93,12 @@ if [[ ${#NEEDED_PKGS[@]} -gt 0 ]]; then
     apt-get install -y --no-install-recommends "${NEEDED_PKGS[@]}"
 fi
 
-for cmd in cdebootstrap zpool zfs sgdisk partprobe mkfs.vfat efibootmgr bootctl curl gpg; do
+for cmd in mmdebstrap zpool zfs sgdisk partprobe mkfs.vfat efibootmgr bootctl curl gpg; do
     command -v "$cmd" &>/dev/null || die "Still missing: $cmd"
 done
 
 [[ -f "${UBUNTU_KEYRING}" ]] || {
-    warn "Ubuntu keyring not found at ${UBUNTU_KEYRING} — cdebootstrap will skip signature verification"
+    warn "Ubuntu keyring not found at ${UBUNTU_KEYRING} — mmdebstrap will skip signature verification"
     UBUNTU_KEYRING=""
 }
 
@@ -456,35 +456,27 @@ info "ZFS mount layout:"
 zfs list -r -o name,mountpoint,canmount 2>/dev/null "${RPOOL}" "${BPOOL}" || true
 echo ""
 
-# ── cdebootstrap ─────────────────────────────────────────────────────────────
-banner "Running cdebootstrap — ${UBUNTU_CODENAME}"
+# ── mmdebstrap ───────────────────────────────────────────────────────────────
+# mmdebstrap replaces cdebootstrap: it uses apt internally and handles modern
+# Ubuntu package formats (including 26.04/resolute) correctly. cdebootstrap 0.7.x
+# has an infinite-loop bug parsing certain 26.04 packages (e.g. gcc-16-base).
+banner "Running mmdebstrap — ${UBUNTU_CODENAME}"
 
-# Build keyring flag only if the file is present on the live system
 KEYRING_FLAG=()
 [[ -n "${UBUNTU_KEYRING}" && -f "${UBUNTU_KEYRING}" ]] && \
     KEYRING_FLAG=(--keyring="${UBUNTU_KEYRING}")
 
-# Run with --verbose so all I:/W:/P: lines appear in the log.
-# On console we filter to P: (progress) only — same as before.
-# Run cdebootstrap with verbose output fully captured to log.
-# Console shows only P: (progress) lines — same appearance as before.
-# The brace group { grep || true; } keeps the pipeline's last stage exit=0 so
-# pipefail doesn't fire on grep. PIPESTATUS[0] is captured immediately after the
-# pipeline, before any subsequent command can overwrite it.
-info "Verbose cdebootstrap output is being logged to ${LOG}"
-cdebootstrap \
-    --verbose \
+info "mmdebstrap output is being logged to ${LOG}"
+mmdebstrap \
     "${KEYRING_FLAG[@]}" \
-    --flavour=standard \
+    --variant=standard \
     --include=locales,apt-utils,gpg,gpg-agent,ca-certificates,ubuntu-keyring \
     "${UBUNTU_CODENAME}" \
     "${POOL_ROOT}" \
     "${UBUNTU_MIRROR}" \
-    2>&1 | tee -a "${LOG}" | { grep --line-buffered -E '^P:' || true; }
-_cdb_rc="${PIPESTATUS[0]}"
-[[ "${_cdb_rc}" -eq 0 ]] || die "cdebootstrap failed (rc=${_cdb_rc}) — see ${LOG} for details"
+    || die "mmdebstrap failed — see ${LOG} for details"
 
-success "cdebootstrap complete"
+success "mmdebstrap complete"
 
 # ── Write configuration files into the target ─────────────────────────────────
 banner "Writing configuration files"
