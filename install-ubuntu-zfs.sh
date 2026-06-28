@@ -34,42 +34,6 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 die()     { echo -e "${RED}[FATAL]${RESET} $*" >&2; exit 1; }
 banner()  { echo -e "\n${BOLD}${CYAN}━━━━━━━━━━  $*  ━━━━━━━━━━${RESET}\n"; }
 
-# ── Hard-coded defaults ───────────────────────────────────────────────────────
-TARGET_DISK="/dev/nvme0n1"
-POOL_ROOT="/mnt/zfsinstall"
-RPOOL="rpool"
-BPOOL="bpool"
-EFI_END="+1G"
-BPOOL_END="+4G"
-UBUNTU_MIRROR="https://archive.ubuntu.com/ubuntu"
-# Live-system keyring path — update if your live ISO puts it elsewhere
-UBUNTU_KEYRING="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
-
-# ── Root guard ────────────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] || die "Must run as root. Try: sudo bash $0"
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-# All console output is transparently duplicated to the log file via tee.
-# Verbose command output (e.g. cdebootstrap --verbose) is also sent there.
-# Console appearance is unchanged — tee passes stdout/stderr through as-is.
-LOG=/var/log/os-install.log
-mkdir -p /var/log
-printf '\n%s\n' "$(printf '=%.0s' {1..60})" >> "${LOG}"
-printf '[%s] install-ubuntu-zfs.sh started (PID %s)\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "${LOG}"
-# Duplicate stdout → tee → log; merge stderr into the same stream.
-exec > >(tee -a "${LOG}") 2>&1
-# Redirect xtrace (set -x) to the log file only — never to console.
-# BASH_XTRACEFD + set -x logs every command with timestamp and line number.
-exec 9>>"${LOG}"
-BASH_XTRACEFD=9
-PS4='+[%(%H:%M:%S)T][L${LINENO}] '
-set -x
-
-# ── Argument parsing ──────────────────────────────────────────────────────────
-# All flags are optional — any omitted value falls back to the interactive prompt.
-# Passwords passed on the command line appear in /proc/<pid>/cmdline while the
-# script runs; acceptable on a single-user live ISO, but be aware.
 _usage() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
@@ -92,6 +56,52 @@ Examples:
 EOF
     exit 0
 }
+
+# ── Hard-coded defaults ───────────────────────────────────────────────────────
+TARGET_DISK="/dev/nvme0n1"
+POOL_ROOT="/mnt/zfsinstall"
+RPOOL="rpool"
+BPOOL="bpool"
+EFI_END="+1G"
+BPOOL_END="+4G"
+UBUNTU_MIRROR="https://archive.ubuntu.com/ubuntu"
+# Live-system keyring path — update if your live ISO puts it elsewhere
+UBUNTU_KEYRING="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+
+# ── Pre-root help shortcut ────────────────────────────────────────────────────
+# Allow --help / -h without root so any user can read usage.
+for _a in "$@"; do [[ "$_a" == "-h" || "$_a" == "--help" ]] && { _usage; }; done
+
+# ── Root guard ────────────────────────────────────────────────────────────────
+# TESTING=1 bypasses the root check so tests/test.sh can run without root.
+[[ $EUID -eq 0 ]] || [[ "${TESTING:-}" == "1" ]] || die "Must run as root. Try: sudo bash $0"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# All console output is transparently duplicated to the log file via tee.
+# Console appearance is unchanged — tee passes stdout/stderr through as-is.
+# In TESTING=1 mode, log to /tmp so root and /var/log are not required.
+if [[ "${TESTING:-}" == "1" ]]; then
+    LOG="/tmp/test-install-$$.log"
+else
+    LOG=/var/log/os-install.log
+    mkdir -p /var/log
+fi
+printf '\n%s\n' "$(printf '=%.0s' {1..60})" >> "${LOG}"
+printf '[%s] install-ubuntu-zfs.sh started (PID %s)\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$$" >> "${LOG}"
+# Duplicate stdout → tee → log; merge stderr into the same stream.
+exec > >(tee -a "${LOG}") 2>&1
+# Redirect xtrace (set -x) to the log file only — never to console.
+# BASH_XTRACEFD + set -x logs every command with timestamp and line number.
+exec 9>>"${LOG}"
+BASH_XTRACEFD=9
+PS4='+[%(%H:%M:%S)T][L${LINENO}] '
+set -x
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+# All flags are optional — any omitted value falls back to the interactive prompt.
+# Passwords passed on the command line appear in /proc/<pid>/cmdline while the
+# script runs; acceptable on a single-user live ISO, but be aware.
 
 # Pre-initialize all flag-settable vars as empty so prompt logic can test them
 UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
@@ -149,20 +159,22 @@ NEEDED_PKGS+=(systemd-boot systemd-boot-efi)
 
 if [[ ${#NEEDED_PKGS[@]} -gt 0 ]]; then
     info "Installing missing live-environment packages: ${NEEDED_PKGS[*]}"
-    apt-get update -qq
-    apt-get install -y --no-install-recommends "${NEEDED_PKGS[@]}"
+    if [[ "${TESTING:-}" != "1" ]]; then
+        apt-get update -qq
+        apt-get install -y --no-install-recommends "${NEEDED_PKGS[@]}"
+    fi
 fi
 
-for cmd in mmdebstrap zpool zfs sgdisk partprobe mkfs.vfat efibootmgr bootctl curl gpg; do
+for cmd in debootstrap zpool zfs sgdisk partprobe mkfs.vfat efibootmgr bootctl curl gpg; do
     command -v "$cmd" &>/dev/null || die "Still missing: $cmd"
 done
 
 [[ -f "${UBUNTU_KEYRING}" ]] || {
-    warn "Ubuntu keyring not found at ${UBUNTU_KEYRING} — mmdebstrap will skip signature verification"
+    warn "Ubuntu keyring not found at ${UBUNTU_KEYRING} — debootstrap will skip signature verification"
     UBUNTU_KEYRING=""
 }
 
-modprobe zfs 2>/dev/null || die "Cannot load ZFS kernel module"
+[[ "${TESTING:-}" == "1" ]] || modprobe zfs 2>/dev/null || die "Cannot load ZFS kernel module"
 success "Prerequisites satisfied"
 
 # ── Interactive configuration ─────────────────────────────────────────────────
